@@ -102,9 +102,6 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
 		return false;
 
-	if (sg_policy->work_in_progress)
-		return false;
-
 	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
 		WRITE_ONCE(sg_policy->limits_changed, false);
 		sg_policy->need_freq_update = true;
@@ -122,10 +119,15 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 		return true;
 	}
 
-	/* No need to recalculate next freq for min_rate_limit_us
-	 * at least. However we might still decide to further rate
-	 * limit once frequency change direction is decided, according
-	 * to the separate rate limits.
+	/* If the last frequency wasn't set yet then we can still amend it */
+	if (sg_policy->work_in_progress)
+		return true;
+
+	/*
+	 * When frequency-invariant utilization tracking is present, there's no
+	 * rate limit when increasing frequency. Therefore, the next frequency
+	 * must be determined before a decision can be made to rate limit the
+	 * frequency change, hence the rate limit check is bypassed here.
 	 */
 
 	delta_ns = time - sg_policy->last_freq_update_time;
