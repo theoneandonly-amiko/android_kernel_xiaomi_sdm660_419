@@ -151,3 +151,9 @@ kernel/configs/android-*.cfg
 
 # Build log
 log.txt
+
+# 
+AnyKernel3/
+*.zip
+out-oc/
+

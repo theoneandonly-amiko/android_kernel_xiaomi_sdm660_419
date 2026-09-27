@@ -1,48 +1,43 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =====================================================================
-# build.sh — Kernel 4.19 SDM660 (whyred) + notifikasi Telegram
-# Selaras dengan env workflow "Build Kernel 4.19 SDM660":
-#   KERNEL_DIR, TC_DIR, OUT_DIR, defconfig, lto_mode
-# Wajib export sebelum run: BOT_TOKEN, CHAT_ID
-# =====================================================================
-
 KERNEL_DIR="${KERNEL_DIR:-$PWD}"
 TC_DIR="${TC_DIR:-$KERNEL_DIR/../toolchain/aosp-clang}"
 OUT_DIR="${OUT_DIR:-$KERNEL_DIR/out}"
 DEVICE="${DEVICE:-whyred}"
 DEFCONFIG="${DEFCONFIG:-vendor/whyred-perf_defconfig}"
 LTO_MODE="${LTO_MODE:-thin}"
-KERNEL_NAME="${KERNEL_NAME:-Maya-Kernel}"
+KERNEL_NAME="${KERNEL_NAME:-Maya-Kernel-v2.0-Sienna}"
 AK3_DIR="${AK3_DIR:-$KERNEL_DIR/AnyKernel3}"
 ZIP_NAME="${KERNEL_NAME}-${DEVICE}-$(date +'%Y%m%d-%H%M').zip"
 
-: "${BOT_TOKEN:?BOT_TOKEN belum di-set}"
-: "${CHAT_ID:?CHAT_ID belum di-set}"
+: "${BOT_TOKEN:?BOT_TOKEN not yet set}"
+: "${CHAT_ID:?CHAT_ID not yet set}"
 
 BUILD_START=$(date +%s)
 
 push_message() {
+    [ "${OC_BUILD:-0}" = "1" ] && return 0
     local resp
     resp=$(curl -s --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 60 \
         -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
         -d chat_id="${CHAT_ID}" \
         -d text="$1" \
         -d parse_mode="html" \
-        -d disable_web_page_preview="true") || { echo "[telegram] curl gagal (exit $?)"; return 0; }
-    echo "$resp" | grep -q '"ok":true' || echo "[telegram] sendMessage gagal: $resp"
+        -d disable_web_page_preview="true") || { echo "[telegram] curl failed (exit $?)"; return 0; }
+    echo "$resp" | grep -q '"ok":true' || echo "[telegram] sendMessage failed: $resp"
 }
 
 push_document() {
+    [ "${OC_BUILD:-0}" = "1" ] && return 0
     local resp
     resp=$(curl -s --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 300 \
         -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
         -F chat_id="${CHAT_ID}" \
         -F document=@"$1" \
         --form-string caption="$2" \
-        -F parse_mode="html") || { echo "[telegram] curl gagal (exit $?)"; return 0; }
-    echo "$resp" | grep -q '"ok":true' || echo "[telegram] sendDocument gagal: $resp"
+        -F parse_mode="html") || { echo "[telegram] curl failed (exit $?)"; return 0; }
+    echo "$resp" | grep -q '"ok":true' || echo "[telegram] sendDocument failed: $resp"
 }
 
 export PATH="$TC_DIR/bin:$PATH"
@@ -96,34 +91,25 @@ IMG="$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
 [ -f "$IMG" ] || IMG="$OUT_DIR/arch/arm64/boot/Image.gz"
 
 if [ "$BUILD_STATUS" -ne 0 ] || [ ! -f "$IMG" ]; then
-    push_message "<b>❌ Build Gagal</b>
+    push_message "<b>❌ Build Failed</b>
 <b>Device:</b> <code>${DEVICE}</code>
-<b>Durasi:</b> <code>${MIN}m ${SEC}s</code>
-Cek log runner untuk detail error, grep 'error' di output di atas."
+<b>Duration:</b> <code>${MIN}m ${SEC}s</code>
+Check the runner log for error details; use grep 'error' on the output above."
     exit 1
 fi
 
-# Base AnyKernel3 (tools/, META-INF, dll) WAJIB disiapkan manual sekali:
-#   mkdir -p AnyKernel3 && cd AnyKernel3
-#   unzip -o /path/paket-yang-terbukti-jalan.zip -d .
-#   rm -f Image.gz-dtb
-# Script TIDAK auto-clone dari GitHub lagi — versi tools terbaru
-# terbukti gagal install di device ini, jadi harus manual pakai
-# paket yang sudah terbukti working.
 if [ ! -f "$AK3_DIR/tools/magiskboot" ]; then
-    push_message "<b>⚠️ AnyKernel3 belum disiapkan</b>
-Folder <code>${AK3_DIR}</code> belum ada <code>tools/magiskboot</code>.
-Extract manual paket yang sudah terbukti jalan dulu, lihat komentar di build.sh."
-    echo "[ak3] GAGAL: $AK3_DIR/tools/magiskboot tidak ditemukan."
-    echo "[ak3] Extract manual dulu paket AK3 yang sudah terbukti jalan:"
+    push_message "<b>⚠️ AnyKernel3 not yet prepared</b>
+Folder <code>${AK3_DIR}</code> none yet <code>tools/magiskboot</code>.
+First, manually extract a package that has been proven to work; see the comments at build.sh."
+    echo "[ak3] GAGAL: $AK3_DIR/tools/magiskboot not found."
+    echo "[ak3] First, manually extract the AK3 package:"
     echo "       mkdir -p \"$AK3_DIR\" && cd \"$AK3_DIR\""
     echo "       unzip -o /path/paket-working.zip -d ."
     echo "       rm -f Image.gz-dtb"
     exit 1
 fi
 
-# anykernel.sh SELALU ditulis ulang tiap build (device properties tetap benar,
-# tools/ bawaan yang sudah terbukti jalan tidak disentuh)
 cat > "$AK3_DIR/anykernel.sh" <<'EOF'
 ### AnyKernel3 Ramdisk Mod Script
 ## osm0sis @ xda-developers
@@ -157,9 +143,6 @@ dump_boot;
 write_boot;
 EOF
 
-# Packaging: cuma yang perlu buat AnyKernel3 (tools/META-INF dari baseline
-# manual + anykernel.sh baru + Image.gz-dtb hasil build), gak ikutan file
-# sisa kayak LICENSE/README/.github biar zip bersih dan kecil.
 cp -f "$IMG" "$AK3_DIR/Image.gz-dtb"
 PACK_ITEMS=(anykernel.sh Image.gz-dtb META-INF tools)
 for item in modules patch ramdisk; do
@@ -169,7 +152,7 @@ done
 
 MD5=$(md5sum "$KERNEL_DIR/$ZIP_NAME" | cut -d' ' -f1)
 
-push_document "$KERNEL_DIR/$ZIP_NAME" "<b>✅ Build Berhasil</b>
+push_document "$KERNEL_DIR/$ZIP_NAME" "<b>✅ Build Success</b>
 <b>Device:</b> <code>${DEVICE}</code>
 <b>Defconfig:</b> <code>${DEFCONFIG}</code>
 <b>LTO:</b> <code>${LTO_MODE}</code>
