@@ -1,0 +1,231 @@
+name: Build kernel (sienna)
+
+# Put this file at .github/workflows/build.yml in YOUR fork of the sienna repo.
+# Run it from the Actions tab -> "Build kernel (sienna)" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device"
+        type: choice
+        options: [lavender, whyred, tulip]
+        default: lavender
+      kernel_name:
+        description: "Your kernel's branding name (letters, digits, . _ - only, max 24)"
+        type: string
+        default: Sienna
+      lto:
+        description: "LTO mode (none is the safest first try)"
+        type: choice
+        options: [none, thin]
+        default: none
+      root:
+        description: "Build with root (off = a root-free kernel, e.g. for banking apps)"
+        type: boolean
+        default: true
+      root_flavor:
+        description: "Root driver: resukisu (+SuSFS hiding) or ksu-original (what sienna ships)"
+        type: choice
+        options: [resukisu, ksu-original]
+        default: resukisu
+      resukisu_ref:
+        description: "ReSukiSU commit/branch/tag (default = version 35179, matches manager 4.2.0-rc3 35179; rexsfx pins 9d0ff6a = 35115)"
+        type: string
+        default: 0e4698951b8e0e1cb997e46f2049c691869a4f45
+      keep_original_tag:
+        description: "Keep the original San-Kernel version tag in uname (long). Off = just your name."
+        type: boolean
+        default: false
+
+env:
+  BRAND: ${{ inputs.kernel_name }}
+  # Original authors. Keep these: they are written into the flasher banner.
+  CREDITS: "based on San-Kernel by user-why-red (Santhosh), Maya Kernel by gusssamm"
+  # KernelSU commit the sienna branch points to ("v3.3.0+", KSU_VERSION 32651).
+  # It comes from backslashxx's KernelSU fork (the non-GKI / old-kernel driver),
+  # not from official tiann/KernelSU. The branch has an empty submodule folder
+  # and no .gitmodules, so we fetch it by hand.
+  KSU_REPO: https://github.com/backslashxx/KernelSU.git
+  KSU_COMMIT: ae81a610ef8c481b9a73e48a962f8eee910b619e
+  # ReSukiSU (root_flavor = resukisu). The commit is the resukisu_ref input.
+  RESU_REPO: https://github.com/ReSukiSU/ReSukiSU.git
+  # Kernel-side hooks + SuSFS v2.3.0 for 4.19, taken from rexsfx's ReSukiSU branch:
+  #   ae31ffa  ReSukiSU v4.2.0 + SuSFS v2.3.0 inline hooks (Santhosh / user-why-red)
+  #   bf4927f  uname spoofing fix for root detector apps (backslashxx)
+  PATCH_REPO: https://github.com/rexsfx/android_kernel_xiaomi_whyred
+  PATCH_COMMITS: "ae31ffa867444f93ef9c61a6cbacced163aef5f6 bf4927fcca2a796327eb47186774d46b2d9bab36"
+  # NoMount: fs/Kconfig always sources fs/nomount/Kconfig, which is a symlink
+  # to ../NoMount/kernel/src (another empty submodule on this branch).
+  NOMOUNT_REPO: https://github.com/maxsteeel/NoMount.git
+  NOMOUNT_COMMIT: 46b7d582eeef99ddbafb995f8aacf7389c9eeb4d
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sienna (no submodules)
+        uses: actions/checkout@v4
+        with:
+          ref: sienna
+          submodules: false
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio zip unzip xz-utils lz4 \
+            python3 device-tree-compiler ccache make libncurses-dev \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          ls -d /usr/lib/llvm-*/bin/clang
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ inputs.device }}-${{ github.sha }}
+          restore-keys: ccache-${{ inputs.device }}-
+
+      - name: Fetch the root driver into KernelSU/
+        env:
+          FLAVOR: ${{ inputs.root_flavor }}
+          RESU_REF: ${{ inputs.resukisu_ref }}
+        run: |
+          # drivers/kernelsu is a symlink to ../KernelSU/kernel, and
+          # drivers/Kconfig always sources it, so this folder must exist even
+          # for a root-free build.
+          rm -rf KernelSU
+          git init -q KernelSU
+          if [ "$FLAVOR" = resukisu ]; then
+            git -C KernelSU remote add origin "$RESU_REPO"
+            # Full history (blobless, so it's fast): ReSukiSU computes its
+            # version code from `git rev-list --count HEAD`, so a shallow clone
+            # gives a tiny number and the manager says "kernel update required".
+            git -C KernelSU fetch --filter=blob:none --tags origin "$RESU_REF"
+            git -C KernelSU checkout -q FETCH_HEAD
+            echo "ReSukiSU version code: $((30000 + $(git -C KernelSU rev-list --count HEAD) + 700))"
+          else
+            git -C KernelSU remote add origin "$KSU_REPO"
+            # The pinned commit is not on any branch, so a normal clone can't
+            # check it out. Fetching by SHA works because GitHub shares objects
+            # across the fork network.
+            if git -C KernelSU fetch --depth 1 origin "$KSU_COMMIT"; then
+              git -C KernelSU checkout -q FETCH_HEAD
+            else
+              echo "::warning::pinned KernelSU commit not fetchable, using rexsfx/KernelSU master (v3.3.0+, one day newer)"
+              git -C KernelSU remote set-url origin https://github.com/rexsfx/KernelSU.git
+              git -C KernelSU fetch --depth 1 origin master
+              git -C KernelSU checkout -q FETCH_HEAD
+            fi
+          fi
+          git -C KernelSU log -1 --format='root driver: %h %cs %s'
+          test -f drivers/kernelsu/Kconfig
+
+      - name: Apply ReSukiSU + SuSFS kernel hooks
+        if: ${{ inputs.root && inputs.root_flavor == 'resukisu' }}
+        run: |
+          # sienna ships backslashxx's hook-less driver, so the kernel source has
+          # none of the hooks ReSukiSU/SuSFS need. Apply them from rexsfx's
+          # commits, skipping parts sienna already has or that we set ourselves
+          # (driver wiring, submodule pointer, defconfigs, release notes).
+          for c in $PATCH_COMMITS; do
+            curl -fsSL -o "/tmp/$c.patch" "$PATCH_REPO/commit/$c.patch"
+            git apply --whitespace=nowarn \
+              --exclude='arch/arm64/configs/*' --exclude=KernelSU \
+              --exclude=san-kernel --exclude=drivers/Kconfig \
+              --exclude=drivers/Makefile --exclude=drivers/kernelsu \
+              "/tmp/$c.patch"
+            echo "applied $c"
+          done
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
+
+      - name: Fetch NoMount into NoMount/
+        run: |
+          rm -rf NoMount
+          git init -q NoMount
+          git -C NoMount remote add origin "$NOMOUNT_REPO"
+          if git -C NoMount fetch --depth 1 origin "$NOMOUNT_COMMIT"; then
+            git -C NoMount checkout -q FETCH_HEAD
+          else
+            echo "::warning::pinned NoMount commit not fetchable, using default branch"
+            git -C NoMount fetch --depth 1 origin HEAD
+            git -C NoMount checkout -q FETCH_HEAD
+          fi
+          git -C NoMount log -1 --format='NoMount: %h %cs %s'
+          test -f fs/nomount/Kconfig
+
+      - name: Set the root options in the defconfig
+        env:
+          ROOT: ${{ inputs.root }}
+          FLAVOR: ${{ inputs.root_flavor }}
+        run: |
+          CFG="arch/arm64/configs/vendor/${{ inputs.device }}-perf_defconfig"
+          test -f "$CFG"
+          # start clean so the two drivers' options can't mix
+          sed -i -e '/^CONFIG_KSU=/d' -e '/^# CONFIG_KSU is not set/d' \
+                 -e '/^CONFIG_KSU_TAMPER_SYSCALL_TABLE=/d' \
+                 -e '/^CONFIG_KSU_SUSFS=/d' "$CFG"
+          if [ "$ROOT" != true ]; then
+            # ReSukiSU's Kconfig defaults KSU to y, so switch it off explicitly
+            echo '# CONFIG_KSU is not set' >> "$CFG"
+          elif [ "$FLAVOR" = resukisu ]; then
+            printf '%s\n' 'CONFIG_KSU=y' 'CONFIG_KSU_SUSFS=y' >> "$CFG"
+          else
+            printf '%s\n' 'CONFIG_KSU=y' 'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' >> "$CFG"
+          fi
+          grep -nE 'KSU|SSG|BFQ' "$CFG"
+
+      - name: Prepare AnyKernel3
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          test -f AnyKernel3/tools/magiskboot
+          rm -rf AnyKernel3/.git
+
+      - name: Patch build.sh for this device
+        run: |
+          # build.sh hard-codes whyred in the AnyKernel3 device check
+          sed -i "s/^device.name1=whyred/device.name1=${{ inputs.device }}/" build.sh
+          grep -n '^device.name1' build.sh
+          # build.sh writes an anykernel.sh in the OLD lowercase AnyKernel3
+          # style (block=, is_slot_device=, $ramdisk). Current AnyKernel3 only
+          # reads UPPERCASE names, so BLOCK came out empty and the flasher
+          # aborted with "Unable to determine  partition". Convert them, and
+          # drop the set_perm_recursive lines: they use $ramdisk, which would
+          # now be empty (-> "/*"), and a kernel-only flash doesn't need them.
+          sed -i \
+            -e 's#^block=.*#BLOCK=boot;#' \
+            -e 's#^is_slot_device=#IS_SLOT_DEVICE=#' \
+            -e 's#^ramdisk_compression=#RAMDISK_COMPRESSION=#' \
+            -e 's#^patch_vbmeta_flag=#PATCH_VBMETA_FLAG=#' \
+            -e '/^set_perm_recursive .*\$ramdisk/d' \
+            build.sh
+          test "$(grep -c '^BLOCK=boot;' build.sh)" = 1
+          ! grep -n '\$ramdisk\|^block=' build.sh
+          grep -n '^BLOCK=\|^IS_SLOT_DEVICE=\|^RAMDISK_COMPRESSION=\|^PATCH_VBMETA_FLAG=' build.sh
+
+      - name: Apply branding (original credits are kept)
+        env:
+          KEEP_TAG: ${{ inputs.keep_original_tag }}
+        run: |
+          if ! [[ "$BRAND" =~ ^[A-Za-z0-9._-]{1,24}$ ]]; then
+            echo "::error::kernel_name must be 1-24 chars of letters, digits, '.', '_' or '-'"
+            exit 1
+          fi
+
+          # 1) Name shown by the flasher (AnyKernel3 banner)
+          sed -i "s#^kernel.string=.*#kernel.string=${BRAND} - ${CREDITS}#" build.sh
+          test "$(grep -c '^kernel.string=' build.sh)" = 1
+          grep -n '^kernel.string=' build.sh
+
+          # 2) Kernel version string (uname -r), shown in Settings -> About and FKM.
+          CFG="arch/arm64/configs/vendor/${{ inputs.device }}-perf_defconfig"
+          if [ "$KEEP_TAG" = true ]; then
+            # long form, e.g. 4.19.325-st20-YourName-San-Kernel-Aegis-R1.1.108
+            sed -i -E "s#^CONFIG_LOCALVERSION=\"(.*)\"#CONFIG_LOCALVERSION=\"-${BRAND}\1\"#" "$CFG"
+          else
+            # short form, e.g. 4.19.325-YourName
+            sed -i -E "s#^CONFIG_LOCALVERSION=\".*\"#CONFIG_LOCALVE
