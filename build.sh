@@ -114,7 +114,7 @@ cat > "$AK3_DIR/anykernel.sh" <<'EOF'
 ### AnyKernel3 Ramdisk Mod Script
 ## osm0sis @ xda-developers
 properties() { '
-kernel.string=MayaKernel by gusssamm
+kernel.string=Neonova - based on San-Kernel by user-why-red (Santhosh), Maya Kernel by gusssamm
 do.devicecheck=1
 do.modules=0
 do.systemless=1
