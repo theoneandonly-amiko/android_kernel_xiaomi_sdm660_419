@@ -1,0 +1,121 @@
+name: Fix Neonova branch (one-off)
+
+# One-off helper for the neonova branch. It adds new commits (nothing is rewritten):
+#   1. reverts three F2FS commits that the original maintainer (Santhosh) also
+#      reverted in rexsfx/android_kernel_xiaomi_whyred on Oct 2, 2026:
+#        ad6432c  f2fs: Block unfair readers while a writer is waiting
+#        1a3ec4f  f2fs: Fail segment alloc when the free map is empty
+#        97bfbe5  f2fs: Do not index NAT/SIT journal at -1
+#   2. compiles the SuSFS uname spoof out of the kernel
+#      (# CONFIG_KSU_SUSFS_SPOOF_UNAME is not set), so the kernel always reports
+#      its real version, whatever uname a root manager has stored.
+#
+# Put this file at .github/workflows/fix-neonova.yml in your fork and run it.
+# It pushes normally (no force). If the branch moved while it ran, just run it again.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to fix"
+        type: string
+        default: neonova
+      revert_f2fs:
+        description: "Revert the three F2FS commits"
+        type: boolean
+        default: true
+      disable_uname_spoof:
+        description: "Compile out the SuSFS uname spoof"
+        type: boolean
+        default: true
+      devices:
+        description: "Devices whose defconfig gets the uname change (space separated)"
+        type: string
+        default: lavender
+
+permissions:
+  contents: write
+
+env:
+  # newest first, so each revert applies on top of the others
+  F2FS_REVERTS: "ad6432cb098a6bebe6ce9408109b8718588c7259 1a3ec4fab76ad8b044d05373167de5e1a082dfcf 97bfbe540573dae8f1c5ade1c4f9d62b78d9d808"
+
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+          submodules: false
+
+      - name: Validate inputs
+        env:
+          DEVICES: ${{ inputs.devices }}
+        run: |
+          [[ "$DEVICES" =~ ^[a-z0-9\ ]+$ ]] || { echo "::error::devices must be lowercase names separated by spaces"; exit 1; }
+          for d in $DEVICES; do
+            test -f "arch/arm64/configs/vendor/${d}-perf_defconfig" || { echo "::error::no vendor/${d}-perf_defconfig on this branch"; exit 1; }
+          done
+
+      - name: Create the commits
+        env:
+          REVERT_F2FS: ${{ inputs.revert_f2fs }}
+          DISABLE_UNAME_SPOOF: ${{ inputs.disable_uname_spoof }}
+          DEVICES: ${{ inputs.devices }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          START=$(git rev-parse HEAD)
+
+          # ---- 1. F2FS reverts ------------------------------------------------
+          if [ "$REVERT_F2FS" = true ]; then
+            for sha in $F2FS_REVERTS; do
+              # a revert only needs the commit and its parent
+              git fetch -q --depth 2 origin "$sha"
+              subj=$(git log -1 --format=%s "$sha")
+              if ! git diff-tree -p "$sha" | git apply -R --check -q 2>/dev/null; then
+                echo "::notice::skipping $sha ($subj): it is already reverted, or later changes overlap it"
+                continue
+              fi
+              git revert --no-commit "$sha" \
+                || { git revert --abort || true; echo "::error::revert of $sha conflicts with later changes"; exit 1; }
+              git commit -q -m "Revert \"$subj\"" \
+                -m "This reverts commit $sha. The same commit was reverted in rexsfx/android_kernel_xiaomi_whyred on Oct 2, 2026 by the original author (Santhosh)."
+              echo "reverted $sha: $subj"
+            done
+          fi
+
+          # ---- 2. no SuSFS uname spoof in the kernel ---------------------------
+          if [ "$DISABLE_UNAME_SPOOF" = true ]; then
+            for d in $DEVICES; do
+              CFG="arch/arm64/configs/vendor/${d}-perf_defconfig"
+              sed -i -e '/^CONFIG_KSU_SUSFS_SPOOF_UNAME=/d' -e '/^# CONFIG_KSU_SUSFS_SPOOF_UNAME is not set/d' "$CFG"
+              echo '# CONFIG_KSU_SUSFS_SPOOF_UNAME is not set' >> "$CFG"
+              git add "$CFG"
+            done
+            if git diff --cached --quiet; then
+              echo "::notice::uname spoof option already off"
+            else
+              git commit -q -m "Compile out the SuSFS uname spoof" \
+                -m "The kernel never spoofs uname by itself: the spoof only applies after a root manager (ksud) stores a value, and that value persists across kernel flashes. With CONFIG_KSU_SUSFS_SPOOF_UNAME off, the kernel always reports its real version. The separate bpfloader/netbpfload/netd special case in kernel/sys.c is left untouched. Devices: $DEVICES."
+            fi
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$START" ]; then
+            echo "Nothing to change; the branch is already fixed."
+          fi
+
+      - name: Show what changed
+        run: |
+          git log --format='%h %an: %s' -8
+          git diff --stat HEAD~1..HEAD 2>/dev/null | tail -4 || true
+
+      - name: Push
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git push origin "HEAD:refs/heads/$BRANCH"
