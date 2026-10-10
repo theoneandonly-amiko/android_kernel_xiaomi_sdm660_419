@@ -1,0 +1,586 @@
+name: Optimize Neonova branch (one-off, pick what you want)
+
+# Pushes optional optimization commits to the neonova branch. Every item is its
+# own commit and its own checkbox, so you can apply ONE at a time, build, test,
+# and know exactly what caused any change. Nothing is rewritten; if an item is
+# already applied it is skipped. If the branch moved while this ran, run it again.
+#
+#   zram_zstd         adds zstd as a SELECTABLE zram algorithm. The default stays
+#                     lz4, so behavior does not change until you pick zstd yourself:
+#                     echo zstd > /sys/block/zram0/comp_algorithm  (before the
+#                     disk size is set, so it needs a boot script or the ROM's zram setup)
+#   zram_default_zstd makes zstd the kernel's DEFAULT zram algorithm
+#                     (CONFIG_ZRAM_DEF_COMP_ZSTD), so zram is created with zstd from the
+#                     very first boot step. This is the "before boot" way. It only has
+#                     an effect if the ROM does not force another algorithm itself.
+#                     lz4 stays compiled in, so you can still switch back later.
+#   fix_zram_list     fixes a real bug in drivers/block/zram/zcomp.c: the list of zram
+#                     algorithms has no commas between its entries, so once two are
+#                     compiled in, C glues their names together ("lz4" + "zstd" =
+#                     "lz4zstd"). zram itself still works, but /sys/block/zram0/comp_algorithm
+#                     (and Franco Kernel Manager) then show one bogus name. Safe, on by default.
+#   neonova_tool      adds tools/neonova-tool.sh, the "Neonova Extra" root menu: status,
+#                     governor and I/O scheduler switch, a guarded zram
+#                     algorithm/size switch with rollback, dexopt and trim, a charging
+#                     current limit, and a panic-log saver. Userspace only: no kernel change.
+#   remove_game_profile  deletes tools/neonova-game-mode.sh from the branch if it is there.
+#                     (The game profile made the phone choke, so it was dropped.)
+#   panic_log_tool    adds tools/neonova-save-panic-log.sh, a root boot script that
+#                     copies the previous boot's panic log out of pstore, so it is
+#                     not lost. Pure userspace: it changes nothing in the kernel.
+#   schedhorizon      builds the "schedhorizon" cpufreq governor (a schedutil variant
+#                     with efficient_freq and up_delay) so it can be selected at
+#                     runtime. The kernel source and Kconfig were already in the tree
+#                     but kernel/sched/Makefile never compiled it. schedutil stays the
+#                     default governor, so nothing changes until you switch:
+#                     echo schedhorizon > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+#   preempt_voluntary EXPERIMENTAL, off by default. Swaps CONFIG_PREEMPT for
+#                     PREEMPT_VOLUNTARY: usually a bit more throughput, a bit less
+#                     smoothness. A scheduling change, so do NOT combine it with
+#                     anything else while you are still chasing the boot panic.
+#
+# Most items are a choice: skip (default, leave as is), apply (add it) or undo (switch it
+# back off with a new commit). Unticking something is NOT enough: skip never removes an
+# earlier commit, only undo does.
+#
+# Put this file at .github/workflows/optimize-neonova.yml in your fork and run it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to update"
+        type: string
+        default: neonova
+      zram_zstd:
+        description: "Add zstd as a selectable zram algorithm (default stays lz4)  [skip = leave as is, apply = add it, undo = switch it back off]"
+        type: choice
+        options: [skip, apply, undo]
+        default: skip
+      zram_default_zstd:
+        description: "Make zstd the DEFAULT zram algorithm (needs the ROM not to override it; lz4 stays available)  [skip = leave as is, apply = add it, undo = switch it back off]"
+        type: choice
+        options: [skip, apply, undo]
+        default: skip
+      fix_zram_list:
+        description: "Fix the zram algorithm list that shows 'lz4zstd' instead of lz4 and zstd"
+        type: boolean
+        default: true
+      neonova_tool:
+        description: "Add the Neonova Extra menu script to tools/ (userspace only)  [skip = leave as is, apply = add it, undo = remove it]"
+        type: choice
+        options: [skip, apply, undo]
+        default: skip
+      remove_game_profile:
+        description: "Delete tools/neonova-game-mode.sh if it is in the branch (the game profile was dropped: it made the phone choke)"
+        type: boolean
+        default: true
+      panic_log_tool:
+        description: "Add the panic-log saver script (userspace only, no kernel change)  [skip = leave as is, apply = add it, undo = switch it back off]"
+        type: choice
+        options: [skip, apply, undo]
+        default: apply
+      schedhorizon:
+        description: "Build the schedhorizon cpufreq governor (selectable at runtime; schedutil stays the default)  [skip = leave as is, apply = add it, undo = switch it back off]"
+        type: choice
+        options: [skip, apply, undo]
+        default: skip
+      preempt_voluntary:
+        description: "EXPERIMENTAL: PREEMPT_VOLUNTARY instead of PREEMPT  [skip = leave as is, apply = add it, undo = switch it back off]"
+        type: choice
+        options: [skip, apply, undo]
+        default: skip
+      devices:
+        description: "Devices whose defconfig gets the changes (space separated)"
+        type: string
+        default: lavender
+
+permissions:
+  contents: write
+
+jobs:
+  optimize:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+          submodules: false
+
+      - name: Validate inputs
+        env:
+          DEVICES: ${{ inputs.devices }}
+        run: |
+          [[ "$DEVICES" =~ ^[a-z0-9\ ]+$ ]] || { echo "::error::devices must be lowercase names separated by spaces"; exit 1; }
+          for d in $DEVICES; do
+            test -f "arch/arm64/configs/vendor/${d}-perf_defconfig" || { echo "::error::no vendor/${d}-perf_defconfig on this branch"; exit 1; }
+          done
+
+      - name: Create the commits
+        env:
+          ZRAM_ZSTD: ${{ inputs.zram_zstd }}
+          FIX_ZRAM_LIST: ${{ inputs.fix_zram_list }}
+          ZRAM_DEFAULT_ZSTD: ${{ inputs.zram_default_zstd }}
+          PANIC_TOOL: ${{ inputs.panic_log_tool }}
+          REMOVE_GAME: ${{ inputs.remove_game_profile }}
+          NEO_TOOL: ${{ inputs.neonova_tool }}
+          SCHEDHORIZON: ${{ inputs.schedhorizon }}
+          PREEMPT_VOL: ${{ inputs.preempt_voluntary }}
+          DEVICES: ${{ inputs.devices }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          START=$(git rev-parse HEAD)
+
+          # sets or replaces a CONFIG_ line in a defconfig; $2 is "y" or "n"
+          setcfg() {
+            local cfg="$1" opt="$2" val="$3" want
+            if [ "$val" = y ]; then want="CONFIG_${opt}=y"; else want="# CONFIG_${opt} is not set"; fi
+            # already exactly right: leave the file alone, so a re-run changes nothing
+            if grep -qxF "$want" "$cfg"; then return 0; fi
+            sed -i -e "/^CONFIG_${opt}=/d" -e "/^# CONFIG_${opt} is not set/d" "$cfg"
+            echo "$want" >> "$cfg"
+          }
+
+          # ---- 1. zstd as a selectable zram algorithm ---------------------------
+          if [ "$ZRAM_ZSTD" = apply ]; then
+            for d in $DEVICES; do
+              CFG="arch/arm64/configs/vendor/${d}-perf_defconfig"
+              setcfg "$CFG" CRYPTO_ZSTD y
+              git add "$CFG"
+            done
+            if git diff --cached --quiet; then echo "::notice::zstd already enabled"; else
+              git commit -q -m "zram: build zstd so it can be selected at runtime" \
+                -m "The zram backend only lists zstd when CONFIG_CRYPTO_ZSTD is set. The default algorithm stays lz4 (CONFIG_ZRAM_DEF_COMP_LZ4), so nothing changes until zstd is chosen. Devices: $DEVICES."
+            fi
+          fi
+
+          # ---- 1a. zstd as the DEFAULT zram algorithm -------------------------
+          if [ "$ZRAM_DEFAULT_ZSTD" = apply ]; then
+            for d in $DEVICES; do
+              CFG="arch/arm64/configs/vendor/${d}-perf_defconfig"
+              setcfg "$CFG" ZRAM_DEF_COMP_ZSTD y   # a Kconfig choice: this also turns the lz4 default off
+              setcfg "$CFG" CRYPTO_LZ4 y           # keep lz4 built in, so it can still be selected
+              git add "$CFG"
+            done
+            if git diff --cached --quiet; then echo "::notice::zstd is already the default"; else
+              git commit -q -m "zram: make zstd the default compression algorithm" \
+                -m "zram now starts with zstd unless the ROM writes another algorithm to /sys/block/zram0/comp_algorithm before the disk size is set. lz4 stays compiled in. Devices: $DEVICES."
+            fi
+          fi
+
+          # ---- 1b. zram algorithm list: missing commas -------------------------
+          if [ "$FIX_ZRAM_LIST" = true ]; then
+            test -f drivers/block/zram/zcomp.c || { echo "::error::drivers/block/zram/zcomp.c is missing"; exit 1; }
+            # add the missing comma to every entry of backends[]; entries that already have one don't match
+            sed -i '/^static const char \* const backends\[\] = {$/,/^};$/ s/^\t"\([^"]*\)"$/\t"\1",/' drivers/block/zram/zcomp.c
+            git add drivers/block/zram/zcomp.c
+            if git diff --cached --quiet; then echo "::notice::zram list already fixed"; else
+              git commit -q -m "zram: add the missing commas to the algorithm list" \
+                -m "Without them C joins adjacent string literals, so with CONFIG_CRYPTO_LZ4 and CONFIG_CRYPTO_ZSTD both set the list held a single bogus entry, lz4zstd, and /sys/block/zram0/comp_algorithm showed that instead of lz4 and zstd. Mainline has the commas. Algorithm names are still validated through the crypto API, so zram itself was never affected."
+            fi
+          fi
+
+          # ---- 2. panic log saver (userspace helper, not part of the kernel) ----
+          if [ "$PANIC_TOOL" = apply ]; then
+            mkdir -p tools
+            cat > tools/neonova-save-panic-log.sh <<'NEONOVA_EOF'
+          #!/system/bin/sh
+          # neonova-save-panic-log.sh
+          #
+          # Saves the previous boot's kernel log (pstore / last_kmsg) before it is lost.
+          # After a kernel panic the log sits in /sys/fs/pstore until the next power-off or
+          # until something deletes it, so copy it out on every boot.
+          #
+          # Install (as root):
+          #   cp neonova-save-panic-log.sh /data/adb/service.d/
+          #   chmod 755 /data/adb/service.d/neonova-save-panic-log.sh
+          # Remove it by deleting that file.
+          #
+          # Output: /sdcard/Download/neonova-panic-logs/<date-time>/
+          # Proof that it ran at all: /data/local/tmp/neonova-panic-saver.log
+
+          OUT_BASE="${OUT_BASE:-/sdcard/Download/neonova-panic-logs}"
+          PSTORE="${PSTORE:-/sys/fs/pstore}"
+          LOG="${LOG:-/data/local/tmp/neonova-panic-saver.log}"
+
+          echo "$(date '+%Y-%m-%d %H:%M:%S') saver ran" >> "$LOG" 2>/dev/null
+
+          # nothing in pstore: nothing to save
+          if [ ! -d "$PSTORE" ] || [ -z "$(ls -A "$PSTORE" 2>/dev/null)" ]; then
+            echo "  pstore empty, nothing to save" >> "$LOG" 2>/dev/null
+            exit 0
+          fi
+
+          # the sdcard may not be mounted yet at this stage: wait up to about 3 minutes
+          PARENT="$(dirname "$OUT_BASE")"
+          i=0
+          while [ ! -d "$PARENT" ] && [ "$i" -lt 90 ]; do
+            sleep 2
+            i=$((i + 1))
+          done
+          [ -d "$PARENT" ] || OUT_BASE="/data/local/tmp/neonova-panic-logs"
+
+          DEST="$OUT_BASE/$(date '+%Y%m%d-%H%M%S')"
+          mkdir -p "$DEST" || exit 1
+
+          cp -r "$PSTORE"/* "$DEST"/ 2>>"$LOG"
+          [ -r /proc/last_kmsg ] && cat /proc/last_kmsg > "$DEST/last_kmsg.txt" 2>/dev/null
+
+          {
+            echo "uname: $(uname -a)"
+            if command -v getprop >/dev/null 2>&1; then
+              echo "boot reason (last): $(getprop sys.boot.reason.last)"
+              echo "boot reason history:"
+              getprop persist.sys.boot.reason.history
+            fi
+          } > "$DEST/info.txt" 2>/dev/null
+
+          # only clear pstore once the copy is really there
+          if [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
+            rm -f "$PSTORE"/* 2>/dev/null
+            echo "  saved to $DEST" >> "$LOG" 2>/dev/null
+          fi
+          exit 0
+          NEONOVA_EOF
+            chmod 755 tools/neonova-save-panic-log.sh
+            git add tools/neonova-save-panic-log.sh
+            git update-index --chmod=+x tools/neonova-save-panic-log.sh
+            if git diff --cached --quiet; then echo "::notice::panic log tool already present"; else
+              git commit -q -m "tools: script that saves the previous boot's panic log" \
+                -m "Copies /sys/fs/pstore (and /proc/last_kmsg) to /sdcard/Download/neonova-panic-logs on every boot, because the log is otherwise easy to lose. Install by hand into /data/adb/service.d/. It changes nothing in the kernel."
+            fi
+          fi
+
+          # ---- 2c. Neonova Extra menu (userspace helper, not part of the kernel) ---
+          if [ "$NEO_TOOL" = apply ]; then
+            mkdir -p tools
+            cat > tools/neonova-tool.sh <<'NEONOVA_TOOL_EOF'
+          #!/system/bin/sh
+          # neonova-tool.sh : "Neonova Extra", a small root menu for the Redmi Note 7 (lavender)
+          #
+          #   su -c 'sh /data/local/tmp/neonova-tool.sh'          menu
+          #   su -c 'sh /data/local/tmp/neonova-tool.sh status'   one-shot status
+          #   su -c 'sh /data/local/tmp/neonova-tool.sh cleanup-game'   (only needed once, see below)
+          #
+          # There is no game profile any more: raising the CPU/GPU floors made the phone choke.
+          # If an old one is still active (or you want its leftover state file gone), run
+          # "cleanup-game": it puts the saved minimum frequencies back and deletes the file.
+          #
+          # Everything here changes live sysfs values or runs standard Android commands.
+          # It edits no system files, and every kernel setting goes back to normal on reboot.
+          # It probes what exists and skips what is missing, so it should not break on other builds.
+
+          SYS="${SYS:-/sys}"
+          PROC="${PROC:-/proc}"
+          STATE_DIR="${STATE_DIR:-/data/local/tmp}"
+          OLD_GAME_STATE="$STATE_DIR/neonova-game-mode.state"   # written by the removed game profile
+          CHG_STATE="$STATE_DIR/neonova-charge.state"
+          OUT_BASE="${OUT_BASE:-/sdcard/Download/neonova-panic-logs}"
+          PSTORE="${PSTORE:-$SYS/fs/pstore}"
+          CPU="$SYS/devices/system/cpu"
+          GPU="$SYS/class/kgsl/kgsl-3d0/devfreq"
+          BAT="$SYS/class/power_supply/battery"
+          ZRAM="$SYS/block/zram0"
+          ZDEV="${ZDEV:-/dev/block/zram0}"
+          IOQ="${IOQ:-$SYS/block/mmcblk0/queue}"
+          BIG_CPUS="${BIG_CPUS:-4 5 6 7}"
+
+          B='\033[1m'; C='\033[36m'; Y='\033[33m'; R='\033[31m'; G='\033[32m'; N='\033[0m'
+          say()   { printf '%b\n' "$*"; }
+          ask()   { printf '%b' "$1"; read -r REPLY || REPLY=q; }
+          pause() { [ -n "$NONINT" ] && return; ask "\n${C}Enter to continue...${N}"; }
+          rd()    { cat "$1" 2>/dev/null; }
+          num()   { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+          banner() {
+            printf '%b' "$C"
+            cat <<'ART'
+            _  _ ___ ___  _  _  _____   ___
+           | \| | __/ _ \| \| |/ _ \ \ / /_\
+           | .` | _| (_) | .` | (_) \ V / _ \
+           |_|\_|___\___/|_|\_|\___/ \_/_/ \_\
+          ART
+            printf '%b\n' "        ${Y}E X T R A${N}"
+          }
+
+          # set_val <state file> <file> <value>: remember the old value, then write the new one
+          set_val() {
+            [ -w "$2" ] || { say "  ${Y}skip (not writable): $2${N}"; return 1; }
+            echo "$2=$(cat "$2")" >> "$1"
+            echo "$3" > "$2" && say "  set $2 -> $3"
+          }
+
+          # ---------------------------------------------------------------- 1) status
+          status() {
+            say "${B}Kernel${N}   $(uname -r)   $(uname -v | cut -c1-40)"
+            say "${B}Uptime${N}   $(cut -d' ' -f1 "$PROC/uptime" 2>/dev/null) s"
+            for c in 0 4; do
+              d="$CPU/cpu$c/cpufreq"; [ -d "$d" ] || continue
+              say "${B}cpu$c${N}     $(rd $d/scaling_governor)  cur $(rd $d/scaling_cur_freq)  min $(rd $d/scaling_min_freq)  max $(rd $d/scaling_max_freq)"
+            done
+            [ -d "$GPU" ] && say "${B}GPU${N}      cur $(rd $GPU/cur_freq)  min $(rd $GPU/min_freq)  max $(rd $GPU/max_freq)  $(rd $GPU/governor)"
+            [ -r "$IOQ/scheduler" ] && say "${B}I/O${N}      $(rd $IOQ/scheduler)"
+            if [ -d "$ZRAM" ]; then
+              say "${B}zram${N}     $(rd $ZRAM/comp_algorithm)   size $(( $(rd $ZRAM/disksize) / 1048576 )) MB   $(grep zram "$PROC/swaps" 2>/dev/null | tr -s ' \t' ' ' | cut -d' ' -f4) KB used"
+            fi
+            say "${B}Memory${N}   available $(( $(grep MemAvailable "$PROC/meminfo" 2>/dev/null | tr -s ' ' ' ' | cut -d' ' -f2) / 1024 )) MB"
+            if [ -d "$BAT" ]; then
+              t="$(rd $BAT/temp)"; num "$t" && bt="$(( t / 10 )).$(( t % 10 )) C"
+              say "${B}Battery${N}  $(rd $BAT/capacity)%  $(rd $BAT/status)  temp ${bt:-?}  current $(rd $BAT/current_now)"
+            fi
+            for z in "$SYS"/class/thermal/thermal_zone*; do
+              [ -r "$z/type" ] || continue
+              case "$(rd $z/type)" in *cpu*|*gpu*|*tsens*) v="$(rd $z/temp)"; num "$v" && say "  $(rd $z/type): $(( v > 1000 ? v / 1000 : v )) C";; esac
+            done 2>/dev/null | head -6
+            command -v getprop >/dev/null 2>&1 && say "${B}Boot${N}     last reason: $(getprop sys.boot.reason.last)"
+            [ -n "$(ls -A "$PSTORE" 2>/dev/null)" ] && say "  ${Y}pstore has files: use 'Save panic log'${N}"
+            [ -e "$OLD_GAME_STATE" ] && say "  ${Y}an old game profile may still be active: run 'cleanup-game'${N}"
+            return 0
+          }
+
+          # ---------------------------------------------------------------- cleanup of the removed game profile
+          cleanup_game() {
+            [ -e "$OLD_GAME_STATE" ] || { say "no old game profile state found, nothing to do"; return; }
+            if [ -s "$OLD_GAME_STATE" ]; then
+              for line in $(sort -r "$OLD_GAME_STATE"); do
+                f="${line%%=*}"; v="${line#*=}"
+                [ -w "$f" ] && echo "$v" > "$f" && say "  restored $f -> $v"
+              done
+            fi
+            rm -f "$OLD_GAME_STATE"; say "${G}old game profile state removed${N}"
+          }
+
+          # ---------------------------------------------------------------- 2) governor
+          governor() {
+            for c in 0 4; do
+              d="$CPU/cpu$c/cpufreq"; [ -w "$d/scaling_governor" ] || continue
+              say "cpu$c (cluster): now $(rd $d/scaling_governor), available: $(rd $d/scaling_available_governors)"
+              ask "  governor for this cluster (empty = skip): "; g="$REPLY"; [ -n "$g" ] || continue
+              case " $(rd $d/scaling_available_governors) " in
+                *" $g "*) [ "$c" = 0 ] && cl="0 1 2 3" || cl="$BIG_CPUS"
+                          for x in $cl; do echo "$g" > "$CPU/cpu$x/cpufreq/scaling_governor" 2>/dev/null; done
+                          say "  now: $(rd $d/scaling_governor)" ;;
+                *) say "  ${R}not available${N}" ;;
+              esac
+            done
+          }
+
+          # ---------------------------------------------------------------- 3) I/O scheduler
+          iosched() {
+            [ -w "$IOQ/scheduler" ] || { say "${R}no scheduler file${N}"; return; }
+            say "I/O schedulers: $(rd $IOQ/scheduler)"
+            ask "  scheduler (empty = skip): "; s="$REPLY"; [ -n "$s" ] || return
+            case " $(rd $IOQ/scheduler | tr -d '[]') " in
+              *" $s "*) echo "$s" > "$IOQ/scheduler" && say "  now: $(rd $IOQ/scheduler)" ;;
+              *) say "  ${R}not available${N}" ;;
+            esac
+          }
+
+          # ---------------------------------------------------------------- 4) zram
+          zram_apply() {  # zram_apply <algorithm> <bytes>; 10 = nothing was touched, 11 = needs rollback
+            swapoff "$ZDEV" || return 10
+            echo 1 > "$ZRAM/reset"            || return 11
+            echo "$1" > "$ZRAM/comp_algorithm" || return 11
+            echo "$2" > "$ZRAM/disksize"      || return 11
+            mkswap "$ZDEV" >/dev/null         || return 11
+            swapon "$ZDEV"                    || return 11
+            return 0
+          }
+          zram_switch() {
+            [ -d "$ZRAM" ] || { say "${R}no zram0${N}"; return; }
+            algs="$(rd $ZRAM/comp_algorithm | tr -d '[]')"
+            old="$(rd $ZRAM/comp_algorithm | sed 's/.*\[\(.*\)\].*/\1/')"
+            oldsize="$(rd $ZRAM/disksize)"
+            say "algorithm: $(rd $ZRAM/comp_algorithm)   size: $(( oldsize / 1048576 )) MB"
+            ask "  algorithm (empty = keep $old): "; a="${REPLY:-$old}"
+            case " $algs " in *" $a "*) ;; *) say "  ${R}not in the list${N}"; return;; esac
+            ask "  size in MB, 512-4096 (empty = keep): "
+            if [ -n "$REPLY" ]; then
+              num "$REPLY" && [ "$REPLY" -ge 512 ] && [ "$REPLY" -le 4096 ] || { say "  ${R}bad size${N}"; return; }
+              size=$(( REPLY * 1048576 ))
+            else size="$oldsize"; fi
+            [ "$a" = "$old" ] && [ "$size" = "$oldsize" ] && { say "  nothing to change"; return; }
+            used="$(grep zram "$PROC/swaps" 2>/dev/null | tr -s ' \t' ' ' | cut -d' ' -f4)"; used="${used:-0}"
+            avail="$(grep MemAvailable "$PROC/meminfo" | tr -s ' ' ' ' | cut -d' ' -f2)"
+            if [ "$used" -gt 300000 ] || [ "$avail" -lt $(( used + 300000 )) ]; then
+              say "  ${R}refused:${N} ${used} KB is in swap and ${avail} KB is free. swapoff has to pull it all back into RAM."
+              say "  Reboot first and run this right after boot."; return
+            fi
+            say "  ${Y}switching: swap goes off for a moment${N}"
+            zram_apply "$a" "$size"; rc=$?
+            if [ $rc -eq 0 ]; then say "  ${G}done: $(rd $ZRAM/comp_algorithm)${N}"
+            elif [ $rc -eq 10 ]; then say "  ${R}swapoff failed, nothing was changed${N}"
+            else
+              say "  ${R}failed, restoring $old / $(( oldsize / 1048576 )) MB${N}"
+              zram_apply "$old" "$oldsize" && say "  ${G}restored${N}" || say "  ${R}RESTORE FAILED: reboot the phone${N}"
+            fi
+          }
+
+          # ---------------------------------------------------------------- 5) apps and storage
+          dex() {
+            command -v cmd >/dev/null 2>&1 || { say "${R}no 'cmd' command here${N}"; return; }
+            say "1) run Android's own background dexopt job (the normal maintenance)"
+            say "2) recompile all apps with speed-profile (slower, uses battery and gets warm)"
+            ask "  choose (empty = back): "
+            case "$REPLY" in
+              1) cmd package bg-dexopt-job ;;
+              2) say "  running, this can take several minutes..."; cmd package compile -m speed-profile -a ;;
+            esac
+          }
+          trim() { command -v sm >/dev/null 2>&1 && sm fstrim || say "${R}no 'sm' command${N}"; }
+
+          # ---------------------------------------------------------------- 6) charging
+          charging() {
+            node="$BAT/constant_charge_current_max"
+            say "capacity $(rd $BAT/capacity)%  status $(rd $BAT/status)  current_now $(rd $BAT/current_now)  temp $(rd $BAT/temp)"
+            [ -r "$node" ] || { say "${Y}no constant_charge_current_max on this kernel: nothing to control${N}"; return; }
+            cur="$(rd $node)"; say "charge current limit now: $cur (assumed microamps = $(( cur / 1000 )) mA)"
+            [ -s "$CHG_STATE" ] && say "  ${Y}an earlier limit is active; 'r' restores the original${N}"
+            ask "  new limit in mA (lower only), r = restore, empty = back: "
+            case "$REPLY" in
+              r) [ -s "$CHG_STATE" ] && { v="$(sed 's/^[^=]*=//' "$CHG_STATE" | head -1)"; echo "$v" > "$node" && say "  restored $v"; rm -f "$CHG_STATE"; } || say "  nothing to restore" ;;
+              '') ;;
+              *) if num "$REPLY" && [ $(( REPLY * 1000 )) -ge 500000 ] && [ $(( REPLY * 1000 )) -lt "$cur" ]; then
+                   [ -s "$CHG_STATE" ] || set_val "$CHG_STATE" "$node" "$(( REPLY * 1000 ))" || return
+                   [ -s "$CHG_STATE" ] && echo "$(( REPLY * 1000 ))" > "$node"; say "  limit: $(rd $node)"
+                 else say "  ${R}refused: must be at least 500 mA and below the current limit${N}"; fi ;;
+            esac
+          }
+
+          # ---------------------------------------------------------------- 7) panic log
+          panic_save() {
+            [ -n "$(ls -A "$PSTORE" 2>/dev/null)" ] || { say "pstore is empty: no panic log to save"; return; }
+            dest="$OUT_BASE/$(date '+%Y%m%d-%H%M%S')"; mkdir -p "$dest" || { say "${R}cannot create $dest${N}"; return; }
+            cp -r "$PSTORE"/* "$dest"/
+            { echo "uname: $(uname -a)"; command -v getprop >/dev/null 2>&1 && getprop sys.boot.reason.last; } > "$dest/info.txt" 2>/dev/null
+            rm -f "$PSTORE"/* 2>/dev/null; say "${G}saved to $dest${N}"
+          }
+
+          # ---------------------------------------------------------------- menu
+          menu() {
+            while true; do
+              banner
+              say "${B}1)${N} Status                      ${B}5)${N} Apps: dexopt jobs, storage trim"
+              say "${B}2)${N} CPU governor                ${B}6)${N} Charging current limit"
+              say "${B}3)${N} I/O scheduler               ${B}7)${N} Save panic log now"
+              say "${B}4)${N} ZRAM: algorithm / size"
+              [ -e "$OLD_GAME_STATE" ] && say "${Y}c)${N} Clean up the old game profile (it is removed; this restores what it changed)"
+              say "${B}q)${N} Exit"
+              ask "Choose: "
+              case "$REPLY" in
+                1) status; pause ;;
+                2) governor; pause ;;
+                3) iosched; pause ;;
+                4) zram_switch; pause ;;
+                5) dex; ask "  also trim storage now? (y/N): "; [ "$REPLY" = y ] && trim; pause ;;
+                6) charging; pause ;;
+                7) panic_save; pause ;;
+                c|C) cleanup_game; pause ;;
+                q|Q) exit 0 ;;
+                *) say "${R}?${N}" ;;
+              esac
+            done
+          }
+
+          case "$1" in
+            status) NONINT=1; status ;;
+            cleanup-game) NONINT=1; cleanup_game ;;
+            '')     menu ;;
+            *)      echo "usage: $0 [status | cleanup-game]"; exit 2 ;;
+          esac
+          NEONOVA_TOOL_EOF
+            chmod 755 tools/neonova-tool.sh
+            git add tools/neonova-tool.sh
+            git update-index --chmod=+x tools/neonova-tool.sh
+            if git diff --cached --quiet; then echo "::notice::neonova tool already present"; else
+              git commit -q -m "tools: Neonova Extra root menu" \
+                -m "Status, governor and I/O scheduler switch, guarded zram switch with rollback, dexopt and storage trim, charging current limit, panic log saver, and a cleanup for the removed game profile. Userspace only, run as root; it changes nothing in the kernel and every kernel setting it touches resets on reboot."
+            fi
+          fi
+
+          # ---- 3. schedhorizon cpufreq governor ---------------------------------
+          if [ "$SCHEDHORIZON" = apply ]; then
+            test -f kernel/sched/cpufreq_schedhorizon.c || { echo "::error::kernel/sched/cpufreq_schedhorizon.c is missing on this branch"; exit 1; }
+            # the source and Kconfig exist, but nothing compiled the file
+            if ! grep -q 'cpufreq_schedhorizon' kernel/sched/Makefile; then
+              sed -i '/^obj-\$(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) += cpufreq_schedutil.o$/a obj-$(CONFIG_CPU_FREQ_GOV_SCHEDHORIZON) += cpufreq_schedhorizon.o' kernel/sched/Makefile
+              grep -q 'cpufreq_schedhorizon' kernel/sched/Makefile || { echo "::error::could not add the schedhorizon build rule to kernel/sched/Makefile"; exit 1; }
+              git add kernel/sched/Makefile
+            fi
+            for d in $DEVICES; do
+              CFG="arch/arm64/configs/vendor/${d}-perf_defconfig"
+              setcfg "$CFG" CPU_FREQ_GOV_SCHEDHORIZON y
+              git add "$CFG"
+            done
+            if git diff --cached --quiet; then echo "::notice::schedhorizon already built"; else
+              git commit -q -m "cpufreq: build the schedhorizon governor (schedutil stays the default)" \
+                -m "kernel/sched/cpufreq_schedhorizon.c and its Kconfig were in the tree, but kernel/sched/Makefile had no rule to compile it. Now it is built in and selectable at runtime; the default governor is still schedutil. Compile-tested with clang 18 against vendor/lavender-perf_defconfig. Devices: $DEVICES."
+            fi
+          fi
+
+          # ---- 4. EXPERIMENTAL: PREEMPT_VOLUNTARY ------------------------------
+          if [ "$PREEMPT_VOL" = apply ]; then
+            for d in $DEVICES; do
+              CFG="arch/arm64/configs/vendor/${d}-perf_defconfig"
+              setcfg "$CFG" PREEMPT n
+              setcfg "$CFG" PREEMPT_VOLUNTARY y
+              git add "$CFG"
+            done
+            if git diff --cached --quiet; then echo "::notice::PREEMPT_VOLUNTARY already set"; else
+              git commit -q -m "EXPERIMENTAL: PREEMPT_VOLUNTARY instead of PREEMPT" \
+                -m "Less preemption overhead, slightly worse worst-case latency. Revert this commit if the phone feels less smooth. Devices: $DEVICES."
+            fi
+          fi
+
+          # ---- UNDO: switch an earlier item back off (adds new commits, rewrites nothing) ----
+          undo_cfg() {  # undo_cfg <message> <CONFIG> <y|n> [<CONFIG> <y|n> ...]
+            local msg="$1"; shift
+            for d in $DEVICES; do
+              CFG="arch/arm64/configs/vendor/${d}-perf_defconfig"
+              set -- "$@"
+              local args=("$@")
+              for ((i=0; i<${#args[@]}; i+=2)); do setcfg "$CFG" "${args[i]}" "${args[i+1]}"; done
+              git add "$CFG"
+            done
+            if git diff --cached --quiet; then echo "::notice::undo not needed: $msg"; else
+              git commit -q -m "Undo: $msg" -m "Switches the option back. Devices: $DEVICES."
+            fi
+          }
+          if [ "$PREEMPT_VOL" = undo ]; then undo_cfg "back to full PREEMPT" PREEMPT y PREEMPT_VOLUNTARY n; fi
+          if [ "$SCHEDHORIZON" = undo ]; then undo_cfg "stop building schedhorizon (the Makefile rule stays, it is harmless)" CPU_FREQ_GOV_SCHEDHORIZON n; fi
+          if [ "$ZRAM_DEFAULT_ZSTD" = undo ]; then undo_cfg "lz4 is the default zram algorithm again" ZRAM_DEF_COMP_ZSTD n ZRAM_DEF_COMP_LZ4 y; fi
+          if [ "$ZRAM_ZSTD" = undo ]; then undo_cfg "do not build zstd for zram" CRYPTO_ZSTD n; fi
+          if [ "$PANIC_TOOL" = undo ] && [ -f tools/neonova-save-panic-log.sh ]; then
+            git rm -q tools/neonova-save-panic-log.sh
+            git commit -q -m "Undo: remove the panic log saver from tools/"
+          fi
+          if [ "$NEO_TOOL" = undo ] && [ -f tools/neonova-tool.sh ]; then
+            git rm -q tools/neonova-tool.sh
+            git commit -q -m "Undo: remove the Neonova Extra menu from tools/"
+          fi
+          if [ "$REMOVE_GAME" = true ] && [ -f tools/neonova-game-mode.sh ]; then
+            git rm -q tools/neonova-game-mode.sh
+            git commit -q -m "Remove the game profile script" \
+              -m "Raising the CPU and GPU frequency floors made the phone choke, so the profile is gone. It was userspace only, so the kernel is unaffected."
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$START" ]; then
+            echo "Nothing to change; every selected item is already applied."
+          fi
+
+      - name: Show what changed
+        run: |
+          git log --format='%h %an: %s' -6
+          grep -nE 'CRYPTO_ZSTD|CONFIG_PREEMPT|SCHEDHORIZON' "arch/arm64/configs/vendor/${DEVICES%% *}-perf_defconfig" || true
+        env:
+          DEVICES: ${{ inputs.devices }}
+
+      - name: Push
+        env:
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git push origin "HEAD:refs/heads/$BRANCH"
